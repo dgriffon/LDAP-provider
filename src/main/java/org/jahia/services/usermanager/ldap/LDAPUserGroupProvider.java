@@ -43,7 +43,7 @@
  */
 package org.jahia.services.usermanager.ldap;
 
-import com.google.common.collect.Lists;
+import com.phloc.commons.mutable.MutableBoolean;
 import com.sun.jndi.ldap.LdapURL;
 
 import org.apache.commons.collections.CollectionUtils;
@@ -57,6 +57,7 @@ import org.jahia.services.usermanager.ldap.cache.LDAPAbstractCacheEntry;
 import org.jahia.services.usermanager.ldap.cache.LDAPCacheManager;
 import org.jahia.services.usermanager.ldap.cache.LDAPGroupCacheEntry;
 import org.jahia.services.usermanager.ldap.cache.LDAPUserCacheEntry;
+import org.jahia.services.usermanager.ldap.callback.*;
 import org.jahia.services.usermanager.ldap.communication.LdapTemplateCallback;
 import org.jahia.services.usermanager.ldap.communication.LdapTemplateWrapper;
 import org.jahia.services.usermanager.ldap.config.AbstractConfig;
@@ -72,6 +73,10 @@ import org.springframework.ldap.core.LdapTemplate;
 import org.springframework.ldap.core.NameClassPairCallbackHandler;
 import org.springframework.ldap.core.support.DefaultIncrementalAttributesMapper;
 import org.springframework.ldap.core.support.LdapContextSource;
+import org.springframework.ldap.filter.AndFilter;
+import org.springframework.ldap.filter.EqualsFilter;
+import org.springframework.ldap.filter.HardcodedFilter;
+import org.springframework.ldap.filter.OrFilter;
 import org.springframework.ldap.query.ConditionCriteria;
 import org.springframework.ldap.query.ContainerCriteria;
 import org.springframework.ldap.query.SearchScope;
@@ -85,7 +90,6 @@ import javax.naming.NamingException;
 import javax.naming.directory.Attribute;
 import javax.naming.directory.Attributes;
 import javax.naming.directory.DirContext;
-import javax.naming.directory.SearchResult;
 import javax.naming.ldap.LdapName;
 import javax.naming.ldap.Rdn;
 
@@ -101,7 +105,7 @@ import static org.springframework.ldap.query.LdapQueryBuilder.query;
  */
 public class LDAPUserGroupProvider extends BaseUserGroupProvider {
 
-    protected static final String OBJECTCLASS_ATTRIBUTE = "objectclass";
+    public static final String OBJECTCLASS_ATTRIBUTE = "objectclass";
     public static final int CONNECTION_ERROR_CACHE_TTL = 5;
     private static Logger logger = LoggerFactory.getLogger(LDAPUserGroupProvider.class);
 
@@ -153,6 +157,19 @@ public class LDAPUserGroupProvider extends BaseUserGroupProvider {
         }
         
         return query;
+    }
+
+    // Getters
+    public LDAPCacheManager getLdapCacheManager() {
+        return ldapCacheManager;
+    }
+
+    public UserConfig getUserConfig() {
+        return userConfig;
+    }
+
+    public GroupConfig getGroupConfig() {
+        return groupConfig;
     }
 
     @Override
@@ -292,7 +309,7 @@ public class LDAPUserGroupProvider extends BaseUserGroupProvider {
             return Collections.emptyList();
         }
 
-        final UsersNameClassPairCallbackHandler searchNameClassPairCallbackHandler = new UsersNameClassPairCallbackHandler();
+        final UsersNameClassPairCallbackHandler searchNameClassPairCallbackHandler = new UsersNameClassPairCallbackHandler(this, getKey());
         long startTime = System.currentTimeMillis();
         ldapTemplateWrapper.execute(new BaseLdapActionCallback<Object>(getExternalUserGroupService(), getKey()) {
 
@@ -402,7 +419,7 @@ public class LDAPUserGroupProvider extends BaseUserGroupProvider {
     private List<String> searchGroups(final Properties searchCriteria, boolean isDynamics) {
 
         final ContainerCriteria query = getGroupQuery(searchCriteria, isDynamics);
-        final GroupsNameClassPairCallbackHandler searchNameClassPairCallbackHandler = new GroupsNameClassPairCallbackHandler(isDynamics);
+        final GroupsNameClassPairCallbackHandler searchNameClassPairCallbackHandler = new GroupsNameClassPairCallbackHandler(this, isDynamics, getKey());
         long startTime = System.currentTimeMillis();
         ldapTemplateWrapper.execute(new BaseLdapActionCallback<Object>(getExternalUserGroupService(), getKey()) {
 
@@ -434,7 +451,7 @@ public class LDAPUserGroupProvider extends BaseUserGroupProvider {
         try {
 
             final LdapURL ldapURL = new LdapURL(url);
-            final DynMembersNameClassPairCallbackHandler nameClassPairCallbackHandler = new DynMembersNameClassPairCallbackHandler();
+            final DynMembersNameClassPairCallbackHandler nameClassPairCallbackHandler = new DynMembersNameClassPairCallbackHandler(this, getKey());
 
             final Set<String> attrs = new HashSet<String>(getUserAttributes());
             attrs.addAll(getGroupAttributes(true));
@@ -523,7 +540,8 @@ public class LDAPUserGroupProvider extends BaseUserGroupProvider {
 
     private List<Member> loadMembers(NamingEnumeration<?> members) {
 
-        List<Member> memberList = new ArrayList<Member>();
+        List<Member> memberList = new ArrayList<>();
+        List<String> missingMembers = new ArrayList<>();
         try {
             while (members != null && members.hasMore()) {
                 final String memberNaming = (String) members.next();
@@ -571,17 +589,33 @@ public class LDAPUserGroupProvider extends BaseUserGroupProvider {
                     }
                 }
 
-                // do queries
-                // and cache the result
-                Member member = null;
-                LDAPUserCacheEntry userCacheEntry = getUserCacheEntryByDN(memberNaming, true);
-                if (userCacheEntry == null) {
-                    // look in groups
-                    LDAPGroupCacheEntry groupCacheEntry = getGroupCacheEntryByDN(memberNaming, true, false);
+                missingMembers.add(memberNaming);
+            }
+        } catch (NamingException e) {
+            logger.error("Error retrieving LDAP group members for group", e);
+        }
+
+        // ask for missing members
+        // do queries
+        // and cache the result
+        MutableBoolean hasError = new MutableBoolean(false);
+        List<LDAPUserCacheEntry> userCacheEntries = getUserCacheEntriesByDN(missingMembers, hasError);
+        if (!hasError.booleanValue()) {
+            for (LDAPUserCacheEntry userCacheEntry : userCacheEntries) {
+                memberList.add(new Member(userCacheEntry.getName(), Member.MemberType.USER));
+                missingMembers.remove(userCacheEntry.getDn());
+            }
+
+            // do queries
+            // and cache the result
+            if (!missingMembers.isEmpty()) {
+                for (String dn : missingMembers) {
+                    Member member = null;
+                    LDAPGroupCacheEntry groupCacheEntry = getGroupCacheEntryByDN(dn, false);
                     if (groupCacheEntry == null) {
                         if (groupConfig.isDynamicEnabled()) {
                             // look in dynamic groups
-                            groupCacheEntry = getGroupCacheEntryByDN(memberNaming, true, true);
+                            groupCacheEntry = getGroupCacheEntryByDN(dn, true);
                             if (groupCacheEntry != null) {
                                 member = new Member(groupCacheEntry.getName(), Member.MemberType.GROUP);
                             }
@@ -589,19 +623,76 @@ public class LDAPUserGroupProvider extends BaseUserGroupProvider {
                     } else {
                         member = new Member(groupCacheEntry.getName(), Member.MemberType.GROUP);
                     }
-                } else {
-                    member = new Member(userCacheEntry.getName(), Member.MemberType.USER);
-                }
 
-                if (member != null) {
-                    memberList.add(member);
+                    if (member != null) {
+                        memberList.add(member);
+                    }
+
                 }
             }
-        } catch (NamingException e) {
-            logger.error("Error retrieving LDAP group members for group", e);
+        } else {
+            throw new RuntimeException("Some errors occur while loading group members");
         }
 
         return memberList;
+    }
+
+    /**
+     * Retrieve the cache entries for a given list of dn, if not found create a new one, and cache it if the param "cache" set to true
+     *
+     * @param dns is the list of dn
+     * @return a list of cache entries
+     */
+
+    private List<LDAPUserCacheEntry> getUserCacheEntriesByDN(final List<String> dns, final MutableBoolean hasError) {
+
+        final List<String> userAttrs = getUserAttributes();
+        final UsersNameClassPairCallbackHandler nameClassPairCallbackHandler = new UsersNameClassPairCallbackHandler(this, getKey());
+        long startTime = System.currentTimeMillis();
+        ldapTemplateWrapper.execute(new BaseLdapActionCallback<Object>(getExternalUserGroupService(), getKey()) {
+
+            @Override
+            public Object doInLdap(LdapTemplate ldapTemplate) {
+
+                // build the users filter
+                OrFilter usersFilter = new OrFilter();
+                int total = dns.size();
+                int remaining = total;
+                for (String dn : dns) {
+                    // extract the user from the DN
+                    usersFilter.append(new EqualsFilter(userConfig.getUidSearchAttribute(), getNameFromDn(dn, true)));
+                    remaining --;
+                    if ((total - remaining) % userConfig.getMaxMembersToRequest() == 0 || remaining == 0) {
+                        AndFilter filter = new AndFilter();
+                        filter.and(usersFilter);
+                        // Append custom filter if necessary
+                        if (StringUtils.isNotEmpty(userConfig.getSearchFilter())) {
+                            filter.and(new HardcodedFilter(userConfig.getSearchFilter()));
+                        }
+                        long start = System.currentTimeMillis();
+                        ldapTemplate.search(query().base(userConfig.getUidSearchName()).attributes(userAttrs.toArray(new String[userAttrs.size()])).filter(usersFilter),
+                                nameClassPairCallbackHandler);
+                        if (logger.isDebugEnabled()) {
+                            logger.debug("{} groups loaded, batch request in {} ms", total - remaining, System.currentTimeMillis() - start);
+                        }
+                        // init the filter
+                        usersFilter = new OrFilter();
+                    }
+                }
+                return null;
+            }
+
+            @Override
+            public Object onError(Exception e) {
+                super.onError(e);
+                hasError.set(true);
+                return null;
+            }
+        });
+        if (logger.isDebugEnabled()) {
+            logger.debug("Get {} users from dn in {} ms", dns.size(), System.currentTimeMillis() - startTime);
+        }
+        return nameClassPairCallbackHandler.getCacheEntries();
     }
 
     /**
@@ -623,7 +714,7 @@ public class LDAPUserGroupProvider extends BaseUserGroupProvider {
         }
 
         final List<String> userAttrs = getUserAttributes();
-        final UserNameClassPairCallbackHandler nameClassPairCallbackHandler = new UserNameClassPairCallbackHandler(userCacheEntry);
+        final UserNameClassPairCallbackHandler nameClassPairCallbackHandler = new UserNameClassPairCallbackHandler(this, userCacheEntry, getKey());
         long startTime = System.currentTimeMillis();
 
         boolean validLdapCall = ldapTemplateWrapper.execute(new BaseLdapActionCallback<Boolean>(getExternalUserGroupService(), getKey()) {
@@ -681,10 +772,10 @@ public class LDAPUserGroupProvider extends BaseUserGroupProvider {
         }
 
         try {
-            groupCacheEntry = getGroupCacheEntryByName(groupName, false, false);
+            groupCacheEntry = getGroupCacheEntryByName(groupName, false);
             if (groupCacheEntry == null) {
                 if (groupConfig.isDynamicEnabled()) {
-                    groupCacheEntry = getGroupCacheEntryByName(groupName, false, true);
+                    groupCacheEntry = getGroupCacheEntryByName(groupName,  true);
                 } else {
                     groupCacheEntry = new LDAPGroupCacheEntry(groupName);
                     groupCacheEntry.setExist(false);
@@ -706,14 +797,13 @@ public class LDAPUserGroupProvider extends BaseUserGroupProvider {
      * Retrieve the cache entry for a given groupname, if not found create a new one, and cache it if the param "cache" set to true
      *
      * @param name
-     * @param cache
      * @param isDynamic
      * @return
      */
-    private LDAPGroupCacheEntry getGroupCacheEntryByName(final String name, boolean cache, final boolean isDynamic) throws Exception {
+    private LDAPGroupCacheEntry getGroupCacheEntryByName(final String name, final boolean isDynamic) throws Exception {
 
         final List<String> groupAttrs = getGroupAttributes(isDynamic);
-        final GroupNameClassPairCallbackHandler nameClassPairCallbackHandler = new GroupNameClassPairCallbackHandler(null, isDynamic);
+        final GroupNameClassPairCallbackHandler nameClassPairCallbackHandler = new GroupNameClassPairCallbackHandler(this, null, isDynamic);
         long startTime = System.currentTimeMillis();
         final Exception[] exceptions = new Exception[1];
 
@@ -743,21 +833,20 @@ public class LDAPUserGroupProvider extends BaseUserGroupProvider {
             logger.debug("Get group {} in {} ms", name, System.currentTimeMillis() - startTime);
         }
 
-        return getAndCacheGroupEntry(nameClassPairCallbackHandler, cache);
+        return getAndCacheGroupEntry(nameClassPairCallbackHandler, false);
     }
 
     /**
      * Retrieve the cache entry for a given dn, if not found create a new one, and cache it if the param "cache" set to true
      *
      * @param dn
-     * @param cache
      * @param isDynamic
      * @return
      */
-    private LDAPGroupCacheEntry getGroupCacheEntryByDN(final String dn, boolean cache, final boolean isDynamic) {
+    private LDAPGroupCacheEntry getGroupCacheEntryByDN(final String dn, final boolean isDynamic) {
 
         final List<String> groupAttrs = getGroupAttributes(isDynamic);
-        final GroupNameClassPairCallbackHandler nameClassPairCallbackHandler = new GroupNameClassPairCallbackHandler(null, isDynamic);
+        final GroupNameClassPairCallbackHandler nameClassPairCallbackHandler = new GroupNameClassPairCallbackHandler(this, null, isDynamic);
         long startTime = System.currentTimeMillis();
         ldapTemplateWrapper.execute(new BaseLdapActionCallback<Object>(getExternalUserGroupService(), getKey()) {
 
@@ -775,7 +864,7 @@ public class LDAPUserGroupProvider extends BaseUserGroupProvider {
             logger.debug("Get group from dn {} in {} ms", dn, System.currentTimeMillis() - startTime);
         }
 
-        return getAndCacheGroupEntry(nameClassPairCallbackHandler, cache);
+        return getAndCacheGroupEntry(nameClassPairCallbackHandler, true);
     }
 
     private LDAPGroupCacheEntry getAndCacheGroupEntry(GroupNameClassPairCallbackHandler nameClassPairCallbackHandler, boolean cache) {
@@ -799,7 +888,7 @@ public class LDAPUserGroupProvider extends BaseUserGroupProvider {
     private LDAPUserCacheEntry getUserCacheEntryByDN(final String dn, boolean cache) {
 
         final List<String> userAttrs = getUserAttributes();
-        final UserNameClassPairCallbackHandler nameClassPairCallbackHandler = new UserNameClassPairCallbackHandler(null);
+        final UserNameClassPairCallbackHandler nameClassPairCallbackHandler = new UserNameClassPairCallbackHandler(this, null, getKey());
         long startTime = System.currentTimeMillis();
         ldapTemplateWrapper.execute(new BaseLdapActionCallback<Object>(getExternalUserGroupService(), getKey()) {
 
@@ -842,328 +931,6 @@ public class LDAPUserGroupProvider extends BaseUserGroupProvider {
             }
         }
         return null;
-    }
-
-    /**
-     * Callback handler for a single user, create the corresponding cache entry
-     */
-    private class UserNameClassPairCallbackHandler implements NameClassPairCallbackHandler {
-
-        private LDAPUserCacheEntry cacheEntry;
-
-        public LDAPUserCacheEntry getCacheEntry() {
-            return cacheEntry;
-        }
-
-        private UserNameClassPairCallbackHandler(LDAPUserCacheEntry cacheEntry) {
-            this.cacheEntry = cacheEntry;
-        }
-
-        @Override
-        public void handleNameClassPair(NameClassPair nameClassPair) throws NamingException {
-            if (nameClassPair instanceof SearchResult) {
-                SearchResult searchResult = (SearchResult) nameClassPair;
-                cacheEntry = attributesToUserCacheEntry(searchResult.getAttributes(), cacheEntry);
-                if (cacheEntry != null) {
-                    cacheEntry.setDn(searchResult.getNameInNamespace());
-                }
-            } else {
-                logger.error("Unexpected NameClassPair " + nameClassPair + " in " + getClass().getName());
-            }
-        }
-    }
-
-    /**
-     * Callback handler for a single group, create the corresponding cache entry
-     */
-    private class GroupNameClassPairCallbackHandler implements NameClassPairCallbackHandler {
-
-        private LDAPGroupCacheEntry cacheEntry;
-        private boolean isDynamic;
-
-        public LDAPGroupCacheEntry getCacheEntry() {
-            return cacheEntry;
-        }
-
-        private GroupNameClassPairCallbackHandler(LDAPGroupCacheEntry cacheEntry, boolean isDynamic) {
-            this.cacheEntry = cacheEntry;
-            this.isDynamic = isDynamic;
-        }
-
-        @Override
-        public void handleNameClassPair(NameClassPair nameClassPair) throws NamingException {
-            if (nameClassPair instanceof SearchResult) {
-                SearchResult searchResult = (SearchResult) nameClassPair;
-                cacheEntry = attributesToGroupCacheEntry(searchResult.getAttributes(), cacheEntry);
-                cacheEntry.setDynamic(isDynamic);
-                if (isDynamic && searchResult.getAttributes().get(groupConfig.getDynamicMembersAttribute()) != null) {
-                    cacheEntry.setDynamicMembersURL(searchResult.getAttributes().get(groupConfig.getDynamicMembersAttribute()).get().toString());
-                }
-                cacheEntry.setDn(searchResult.getNameInNamespace());
-            } else {
-                logger.error("Unexpected NameClassPair " + nameClassPair + " in " + getClass().getName());
-            }
-        }
-    }
-
-    /**
-     * Callback handler for users, retrieve the list of usernames
-     */
-    private class UsersNameClassPairCallbackHandler implements NameClassPairCallbackHandler {
-
-        private List<String> names = new ArrayList<String>();
-
-        public List<String> getNames() {
-            return names;
-        }
-
-        @Override
-        public void handleNameClassPair(NameClassPair nameClassPair) throws NamingException {
-            if (nameClassPair instanceof SearchResult) {
-                SearchResult searchResult = (SearchResult) nameClassPair;
-                LDAPUserCacheEntry cacheEntry = ldapCacheManager.getUserCacheEntryByDn(getKey(), searchResult.getNameInNamespace());
-                if (cacheEntry == null || cacheEntry.getExist() ==  null || !cacheEntry.getExist()) {
-                    UserNameClassPairCallbackHandler nameClassPairCallbackHandler = new UserNameClassPairCallbackHandler(cacheEntry);
-                    nameClassPairCallbackHandler.handleNameClassPair(nameClassPair);
-                    cacheEntry = nameClassPairCallbackHandler.getCacheEntry();
-                    if (cacheEntry != null) {
-                        ldapCacheManager.cacheUser(getKey(), cacheEntry);
-                    }
-                }
-                if (cacheEntry != null) {
-                    names.add(cacheEntry.getName());
-                }
-            } else {
-                logger.error("Unexpected NameClassPair " + nameClassPair + " in " + getClass().getName());
-            }
-        }
-    }
-
-    /**
-     * Callback handler for groups, retrieve the list of groupnames
-     */
-    private class GroupsNameClassPairCallbackHandler implements NameClassPairCallbackHandler {
-
-        private List<String> names = new LinkedList<>();
-        private boolean isDynamic;
-
-        public List<String> getNames() {
-            return names;
-        }
-
-        private GroupsNameClassPairCallbackHandler(boolean isDynamic) {
-            this.isDynamic = isDynamic;
-        }
-
-        @Override
-        public void handleNameClassPair(NameClassPair nameClassPair) throws NamingException {
-            if (nameClassPair instanceof SearchResult) {
-                SearchResult searchResult = (SearchResult) nameClassPair;
-                LDAPGroupCacheEntry cacheEntry = ldapCacheManager.getGroupCacheEntryByDn(getKey(), searchResult.getNameInNamespace());
-                if (cacheEntry == null || cacheEntry.getExist() == null || !cacheEntry.getExist().booleanValue()) {
-                    GroupNameClassPairCallbackHandler nameClassPairCallbackHandler = new GroupNameClassPairCallbackHandler(cacheEntry, isDynamic);
-                    nameClassPairCallbackHandler.handleNameClassPair(nameClassPair);
-                    cacheEntry = nameClassPairCallbackHandler.getCacheEntry();
-                    if (cacheEntry != null) {
-                        ldapCacheManager.cacheGroup(getKey(), cacheEntry);
-                    }
-                }
-                if (cacheEntry != null) {
-                    names.add(cacheEntry.getName());
-                }
-            } else {
-                logger.error("Unexpected NameClassPair " + nameClassPair + " in " + getClass().getName());
-            }
-        }
-    }
-
-    /**
-     * Calback handler for dynamic members, retrieve the list of members
-     */
-    private class DynMembersNameClassPairCallbackHandler implements NameClassPairCallbackHandler {
-
-        private List<Member> members = Lists.newArrayList();
-
-        public List<Member> getMembers() {
-            return members;
-        }
-
-        @Override
-        public void handleNameClassPair(NameClassPair nameClassPair) throws NamingException {
-
-            if (nameClassPair instanceof SearchResult) {
-
-                SearchResult searchResult = (SearchResult) nameClassPair;
-
-                // try to know if we deal with a group or a user
-                Boolean isUser = guessUserOrGroupFromDN(searchResult.getNameInNamespace());
-
-                // try to retrieve the object from the cache
-                LDAPAbstractCacheEntry cacheEntry;
-                if (isUser != null) {
-                    if (isUser) {
-                        cacheEntry = ldapCacheManager.getUserCacheEntryByDn(getKey(), searchResult.getNameInNamespace());
-                    } else {
-                        cacheEntry = ldapCacheManager.getGroupCacheEntryByDn(getKey(), searchResult.getNameInNamespace());
-                    }
-                } else {
-                    // look in all cache
-                    cacheEntry = ldapCacheManager.getUserCacheEntryByDn(getKey(), searchResult.getNameInNamespace());
-                    if (cacheEntry == null) {
-                        cacheEntry = ldapCacheManager.getGroupCacheEntryByDn(getKey(), searchResult.getNameInNamespace());
-                        isUser = cacheEntry != null ? false : null;
-                    } else {
-                        isUser = true;
-                    }
-                }
-                if (cacheEntry != null) {
-                    if (isUser) {
-                        if (logger.isDebugEnabled()) {
-                            logger.debug("Dynamic member {} retrieved from cache and resolved as a user", searchResult.getNameInNamespace());
-                        }
-                        members.add(new Member(cacheEntry.getName(), Member.MemberType.USER));
-                    } else {
-                        if (logger.isDebugEnabled()) {
-                            logger.debug("Dynamic member {} retrieved from cache and resolved as a group", searchResult.getNameInNamespace());
-                        }
-                        members.add(new Member(cacheEntry.getName(), Member.MemberType.GROUP));
-                    }
-                }
-
-                // try the objectclass
-                Boolean isDynamic = false;
-                searchResult.getAttributes().get(OBJECTCLASS_ATTRIBUTE).getAll();
-                List<String> objectclasses = new ArrayList<String>();
-                LdapUtils.collectAttributeValues(searchResult.getAttributes(), OBJECTCLASS_ATTRIBUTE, objectclasses, String.class);
-                if (objectclasses.contains(userConfig.getSearchObjectclass())) {
-                    isUser = true;
-                } else if (objectclasses.contains(groupConfig.getSearchObjectclass())) {
-                    isUser = false;
-                } else if (groupConfig.isDynamicEnabled() && objectclasses.contains(groupConfig.getDynamicSearchObjectclass())) {
-                    isUser = false;
-                    isDynamic = true;
-                }
-                if (isUser != null) {
-                    if (isUser) {
-                        handleUserNameClassPair(nameClassPair, searchResult);
-                    } else {
-                        handleGroupNameClassPair(nameClassPair, searchResult, isDynamic);
-                    }
-                    return;
-                }
-
-                // try to guess the type on attributes present in the searchresult
-                List<String> searchResultsAttr = new ArrayList<String>();
-                NamingEnumeration<String> attrs = searchResult.getAttributes().getIDs();
-                while (attrs.hasMore()) {
-                    searchResultsAttr.add(attrs.next());
-                }
-                List<String> commonUserAttrs = getCommonAttributes(searchResultsAttr, getUserAttributes());
-                List<String> commonGroupAttrs = getCommonAttributes(searchResultsAttr, getGroupAttributes(isDynamic));
-                if (commonUserAttrs.contains(userConfig.getUidSearchAttribute()) && commonUserAttrs.size() > commonGroupAttrs.size()) {
-                    handleUserNameClassPair(nameClassPair, searchResult);
-                    return;
-                } else if (commonGroupAttrs.contains(groupConfig.getSearchAttribute())) {
-                    handleGroupNameClassPair(nameClassPair, searchResult, false);
-                    return;
-                }
-
-                // type not resolved
-                logger.warn("Dynamic member: " + searchResult.getNameInNamespace() + " not resolved as a user or a group");
-            } else {
-                logger.error("Unexpected NameClassPair " + nameClassPair + " in " + getClass().getName());
-            }
-        }
-
-        private void handleGroupNameClassPair(NameClassPair nameClassPair, SearchResult searchResult, Boolean isDynamic) throws NamingException {
-            GroupNameClassPairCallbackHandler groupNameClassPairCallbackHandler = new GroupNameClassPairCallbackHandler(null, isDynamic);
-            groupNameClassPairCallbackHandler.handleNameClassPair(nameClassPair);
-            LDAPGroupCacheEntry groupCacheEntry = groupNameClassPairCallbackHandler.getCacheEntry();
-            ldapCacheManager.cacheGroup(getKey(), groupCacheEntry);
-            members.add(new Member(groupCacheEntry.getName(), Member.MemberType.GROUP));
-            if (logger.isDebugEnabled()) {
-                logger.debug("Dynamic member {} resolved as a {}", searchResult.getNameInNamespace(), isDynamic ? " dynamic group" : " group");
-            }
-        }
-
-        private void handleUserNameClassPair(NameClassPair nameClassPair, SearchResult searchResult) throws NamingException {
-            UserNameClassPairCallbackHandler userNameClassPairCallbackHandler = new UserNameClassPairCallbackHandler(null);
-            userNameClassPairCallbackHandler.handleNameClassPair(nameClassPair);
-            LDAPUserCacheEntry userCacheEntry = userNameClassPairCallbackHandler.getCacheEntry();
-            if (userCacheEntry != null) {
-                ldapCacheManager.cacheUser(getKey(), userCacheEntry);
-                members.add(new Member(userCacheEntry.getName(), Member.MemberType.USER));
-                logger.debug("Dynamic member {} resolved as a user", searchResult.getNameInNamespace());
-            }
-        }
-    }
-
-    /**
-     * Populate the given cache entry or create new one if the given is null with the LDAP attributes
-     *
-     * @param attrs
-     * @param userCacheEntry
-     * @return
-     * @throws NamingException
-     */
-    private LDAPUserCacheEntry attributesToUserCacheEntry(Attributes attrs, LDAPUserCacheEntry userCacheEntry) throws NamingException {
-        Attribute uidAttr = attrs.get(userConfig.getUidSearchAttribute());
-        if (uidAttr == null) {
-            logger.warn("LDAP user entry is missing the required {} attribute. Skipping user. Available attributes: {}",
-                    userConfig.getUidSearchAttribute(), attrs);
-            return null;
-        }
-        String userId = (String) uidAttr.get();
-        JahiaUser jahiaUser = new JahiaUserImpl(encode(userId), null, attributesToJahiaProperties(attrs, true), getKey(), null);
-        if (userCacheEntry == null) {
-            userCacheEntry = new LDAPUserCacheEntry(userId);
-        }
-        userCacheEntry.setExist(true);
-        userCacheEntry.setUser(jahiaUser);
-        return userCacheEntry;
-    }
-
-    /**
-     * Populate the given cache entry or create new one if the given is null with the LDAP attributes
-     *
-     * @param attrs
-     * @param groupCacheEntry
-     * @return
-     * @throws NamingException
-     */
-    private LDAPGroupCacheEntry attributesToGroupCacheEntry(Attributes attrs, LDAPGroupCacheEntry groupCacheEntry) throws NamingException {
-        String groupId = (String) attrs.get(groupConfig.getSearchAttribute()).get();
-        JahiaGroup jahiaGroup = new JahiaGroupImpl(encode(groupId), null, null, attributesToJahiaProperties(attrs, false));
-
-        if (groupCacheEntry == null) {
-            groupCacheEntry = new LDAPGroupCacheEntry(jahiaGroup.getName());
-        }
-        groupCacheEntry.setExist(true);
-        groupCacheEntry.setGroup(jahiaGroup);
-        return groupCacheEntry;
-    }
-
-    /**
-     * Map ldap attributes to jahia properties
-     *
-     * @param attributes
-     * @param isUser
-     * @return
-     */
-    private Properties attributesToJahiaProperties(Attributes attributes, boolean isUser) {
-        Properties props = new Properties();
-        Map<String, String> attributesMapper = isUser ? userConfig.getAttributesMapper() : groupConfig.getAttributesMapper();
-        for (String propertyKey : attributesMapper.keySet()) {
-            Attribute ldapAttribute = attributes.get(attributesMapper.get(propertyKey));
-            try {
-                if (ldapAttribute != null && ldapAttribute.get() instanceof String) {
-                    props.put(propertyKey, ldapAttribute.get());
-                }
-            } catch (NamingException e) {
-                logger.error("Error reading LDAP attribute:" + ldapAttribute.toString());
-            }
-        }
-        return props;
     }
 
     /**
@@ -1407,7 +1174,7 @@ public class LDAPUserGroupProvider extends BaseUserGroupProvider {
      * @return
      * @throws InvalidNameException
      */
-    private Boolean guessUserOrGroupFromDN(String dn) throws InvalidNameException {
+    public Boolean guessUserOrGroupFromDN(String dn) throws InvalidNameException {
         Boolean isUser = null;
         final LdapName memberLdapName = LdapUtils.newLdapName(dn);
         if (memberLdapName.startsWith(new LdapName(userConfig.getUidSearchName()))) {
@@ -1425,7 +1192,7 @@ public class LDAPUserGroupProvider extends BaseUserGroupProvider {
      *
      * @return
      */
-    private List<String> getUserAttributes() {
+    public List<String> getUserAttributes() {
         List<String> attrs = new ArrayList<String>(userConfig.getAttributesMapper().values());
         attrs.add(userConfig.getUidSearchAttribute());
         return attrs;
@@ -1436,7 +1203,7 @@ public class LDAPUserGroupProvider extends BaseUserGroupProvider {
      *
      * @return
      */
-    private List<String> getGroupAttributes(boolean isDynamic) {
+    public List<String> getGroupAttributes(boolean isDynamic) {
         List<String> attrs = new ArrayList<String>(groupConfig.getAttributesMapper().values());
         attrs.add(groupConfig.getSearchAttribute());
         if (isDynamic) {
@@ -1452,7 +1219,7 @@ public class LDAPUserGroupProvider extends BaseUserGroupProvider {
      * @param second
      * @return
      */
-    private List<String> getCommonAttributes(List<String> first, List<String> second) {
+    public List<String> getCommonAttributes(List<String> first, List<String> second) {
         List<String> commons = new ArrayList<String>(first);
         commons.retainAll(second);
         return commons;
@@ -1542,11 +1309,11 @@ public class LDAPUserGroupProvider extends BaseUserGroupProvider {
         }
     }
 
-    private String decode(String name) {
+    public static String decode(String name) {
         return Text.unescapeIllegalJcrChars(name);
     }
 
-    private String encode(String value) throws NamingException {
+    public static String encode(String value) throws NamingException {
         return Text.escapeIllegalJcrChars(value); 
     }
 }

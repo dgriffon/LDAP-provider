@@ -56,6 +56,7 @@ import java.util.Set;
 public abstract class AbstractConfig {
     private static final int DEFAULT_SEARCH_COUNT_LIMIT = 100;
     private static final int DEFAULT_MAX_TIMEOUT_COUNT = 3;
+    private static final int DEFAULT_MAX_MEMBERS_TO_REQUEST = 200;
 
     private String url;
     private String publicBindDn;
@@ -90,6 +91,7 @@ public abstract class AbstractConfig {
     private int maxLdapTimeoutCountBeforeDisconnect = DEFAULT_MAX_TIMEOUT_COUNT;
 
     private long searchCountlimit = DEFAULT_SEARCH_COUNT_LIMIT;
+    private int maxMembersToRequest = DEFAULT_MAX_MEMBERS_TO_REQUEST;
     /**
      * Fixed query filter that is used when searching for users/groups to filter out "unwanted" entries.
      */
@@ -391,5 +393,20 @@ public abstract class AbstractConfig {
      */
     public void setSearchFilter(String searchFilter) {
         this.searchFilter = (searchFilter != null && searchFilter.length() > 0 ? searchFilter : null);
+    }
+
+    /**
+     * Get the maximum of members to request at once when getting group members
+     * @return the maximum number of members to request
+     */
+    public int getMaxMembersToRequest() {
+        return maxMembersToRequest;
+    }
+
+    /**
+     * Set the maximum of members to request at once when getting group members
+     */
+    public void setMaxMembersToRequest(int maxMembersToRequest) {
+        this.maxMembersToRequest = maxMembersToRequest;
     }
 }
